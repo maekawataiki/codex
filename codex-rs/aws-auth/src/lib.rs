@@ -2,14 +2,17 @@ mod config;
 mod discovery;
 mod signing;
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
+use aws_credential_types::Credentials;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::provider::SharedCredentialsProvider;
 use bytes::Bytes;
 use http::HeaderMap;
 use http::Method;
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 pub use discovery::AwsProfile;
 pub use discovery::discover_aws_profiles;
@@ -93,6 +96,10 @@ pub enum AwsAuthError {
 #[derive(Clone)]
 pub struct AwsAuthContext {
     credentials_provider: SharedCredentialsProvider,
+    /// Cached credentials from the last successful `provide_credentials()` call.
+    /// This avoids re-invoking `credential_process` on every SigV4 signing
+    /// operation within the same session.
+    cached_credentials: Arc<Mutex<Option<Credentials>>>,
     region: String,
     service: String,
 }
@@ -114,6 +121,7 @@ impl AwsAuthContext {
 
         Ok(Self {
             credentials_provider,
+            cached_credentials: Arc::new(Mutex::new(None)),
             region,
             service: config.service.trim().to_string(),
         })
@@ -165,8 +173,45 @@ impl AwsAuthContext {
         request: AwsRequestToSign,
         time: SystemTime,
     ) -> Result<AwsSignedRequest, AwsAuthError> {
-        let credentials = self.credentials_provider.provide_credentials().await?;
+        let credentials = self.get_or_refresh_credentials().await?;
         signing::sign_request(&credentials, &self.region, &self.service, request, time)
+    }
+
+    /// Returns cached credentials if they are still valid (more than 5 minutes
+    /// until expiry), otherwise fetches fresh ones from the provider and caches
+    /// them.
+    async fn get_or_refresh_credentials(&self) -> Result<Credentials, AwsAuthError> {
+        // Check cache without holding the lock across an await point.
+        {
+            let cached = self.cached_credentials.lock().await;
+            if let Some(creds) = cached.as_ref().filter(|c| credentials_still_valid(c)) {
+                return Ok(creds.clone());
+            }
+        }
+
+        // Cache miss or expired — fetch fresh credentials. This await is
+        // outside the lock so concurrent callers can still read cached values.
+        let fresh = self.credentials_provider.provide_credentials().await?;
+
+        {
+            let mut cached = self.cached_credentials.lock().await;
+            *cached = Some(fresh.clone());
+        }
+
+        Ok(fresh)
+    }
+}
+
+/// Returns `true` if the credentials are still usable (more than 5 minutes
+/// until expiry, or no expiry at all for static credentials).
+fn credentials_still_valid(creds: &Credentials) -> bool {
+    match creds.expiry() {
+        Some(expiry) => {
+            let remaining = expiry.duration_since(SystemTime::now()).unwrap_or_default();
+            remaining.as_secs() > 300
+        }
+        // No expiry = static credentials, always valid.
+        None => true,
     }
 }
 
@@ -214,6 +259,7 @@ mod tests {
                 /*expires_after*/ None,
                 "unit-test",
             )),
+            cached_credentials: Arc::new(Mutex::new(None)),
             region: "us-east-1".to_string(),
             service: "bedrock".to_string(),
         }
@@ -329,5 +375,68 @@ mod tests {
         .expect_err("profile auth should require a configured profile");
 
         assert_eq!(err.to_string(), "AWS profile must be configured");
+    }
+
+    /// A credential provider that counts how many times it is invoked.
+    #[derive(Debug)]
+    struct CountingCredentialsProvider {
+        call_count: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl aws_credential_types::provider::ProvideCredentials for CountingCredentialsProvider {
+        fn provide_credentials<'a>(
+            &'a self,
+        ) -> aws_credential_types::provider::future::ProvideCredentials<'a>
+        where
+            Self: 'a,
+        {
+            self.call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            aws_credential_types::provider::future::ProvideCredentials::ready(Ok(Credentials::new(
+                "AKIDEXAMPLE",
+                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+                None,
+                Some(UNIX_EPOCH + Duration::from_secs(4_100_000_000)),
+                "counting-test",
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_signing_invokes_credential_provider_once() {
+        let call_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = call_count.clone();
+        let provider = CountingCredentialsProvider { call_count };
+        let context = AwsAuthContext {
+            credentials_provider: SharedCredentialsProvider::new(provider),
+            cached_credentials: Arc::new(Mutex::new(None)),
+            region: "us-east-1".to_string(),
+            service: "bedrock".to_string(),
+        };
+
+        let time = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        // Fire 10 concurrent sign() calls.
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let ctx = context.clone();
+            handles.push(tokio::spawn(async move {
+                ctx.sign_at(test_request(), time)
+                    .await
+                    .expect("signing should succeed")
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
+
+        // The credential provider should be called at most once because all
+        // concurrent callers share the cached credentials.
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "credential provider should be invoked exactly once across concurrent sign() calls"
+        );
     }
 }

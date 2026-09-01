@@ -48,6 +48,17 @@ pub(super) enum BedrockAuthMethod {
     AwsSdkAuth { context: AwsAuthContext },
 }
 
+impl BedrockAuthMethod {
+    /// Returns the resolved AWS region for this auth method.
+    pub(super) fn region(&self) -> &str {
+        match self {
+            BedrockAuthMethod::ManagedBearerToken { region, .. }
+            | BedrockAuthMethod::EnvBearerToken { region, .. } => region,
+            BedrockAuthMethod::AwsSdkAuth { context } => context.region(),
+        }
+    }
+}
+
 pub(super) fn auth_source(
     provider_info: &ModelProviderInfo,
     auth_manager: Option<&AuthManager>,
@@ -160,21 +171,19 @@ pub(super) async fn resolve_auth_method(
     }
 }
 
-pub(super) async fn resolve_provider_auth(
-    source: BedrockAuthSource,
-    managed_auth: Option<&CodexAuth>,
-    aws: &ModelProviderAwsAuthInfo,
+pub(super) fn auth_provider_from_method(
+    method: BedrockAuthMethod,
     endpoint: BedrockEndpoint,
-) -> Result<SharedAuthProvider> {
-    match resolve_auth_method(source, managed_auth, aws, endpoint).await? {
+) -> SharedAuthProvider {
+    match method {
         BedrockAuthMethod::ManagedBearerToken { token, .. }
-        | BedrockAuthMethod::EnvBearerToken { token, .. } => Ok(Arc::new(BearerAuthProvider {
+        | BedrockAuthMethod::EnvBearerToken { token, .. } => Arc::new(BearerAuthProvider {
             token: Some(token),
             account_id: None,
             is_fedramp_account: false,
-        })),
+        }),
         BedrockAuthMethod::AwsSdkAuth { context } => {
-            Ok(Arc::new(BedrockSigV4AuthProvider::new(context, endpoint)))
+            Arc::new(BedrockSigV4AuthProvider::new(context, endpoint))
         }
     }
 }
@@ -196,11 +205,8 @@ pub(super) async fn resolve_region(
         return Ok(context.region().to_string());
     }
 
-    match resolve_auth_method(source, managed_auth, aws, endpoint).await? {
-        BedrockAuthMethod::ManagedBearerToken { region, .. }
-        | BedrockAuthMethod::EnvBearerToken { region, .. } => Ok(region),
-        BedrockAuthMethod::AwsSdkAuth { context } => Ok(context.region().to_string()),
-    }
+    let method = resolve_auth_method(source, managed_auth, aws, endpoint).await?;
+    Ok(method.region().to_string())
 }
 
 fn non_empty_env_var_from(

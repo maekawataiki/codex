@@ -27,6 +27,7 @@ use codex_protocol::account::ProviderAccount;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::openai_models::ModelsResponse;
+use tokio::sync::OnceCell;
 
 use crate::auth::auth_manager_for_provider;
 use crate::auth::resolve_provider_auth as resolve_configured_provider_auth;
@@ -39,7 +40,8 @@ use crate::provider::ProviderCapabilities;
 use crate::provider::ProviderUnauthorizedRecovery;
 use crate::provider::RemoteCompactionSupport;
 use crate::shared_state::process_shared_state;
-use auth::resolve_provider_auth as resolve_bedrock_provider_auth;
+use auth::auth_provider_from_method;
+use auth::resolve_auth_method;
 pub(crate) use auth_refresh::AwsAuthRecovery;
 use catalog::normalize_bedrock_catalog;
 pub(crate) use catalog::static_model_catalog;
@@ -55,13 +57,31 @@ pub(super) enum BedrockEndpoint {
 }
 
 /// Runtime provider for Amazon Bedrock's OpenAI-compatible endpoints.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct AmazonBedrockModelProvider {
     pub(crate) info: ModelProviderInfo,
     aws: ModelProviderAwsAuthInfo,
     endpoint: BedrockEndpoint,
     auth_manager: Option<Arc<AuthManager>>,
     auth_recovery: Option<Arc<AwsAuthRecovery>>,
+    /// Cached resolved base URL and auth provider. Populated on first call to
+    /// `resolve_base_url_and_auth` so that `runtime_base_url()` and
+    /// `api_auth()` share a single AWS SDK config load instead of each
+    /// independently invoking `credential_process`.
+    cached_auth: Arc<OnceCell<(Option<String>, SharedAuthProvider)>>,
+}
+
+impl std::fmt::Debug for AmazonBedrockModelProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmazonBedrockModelProvider")
+            .field("info", &self.info)
+            .field("aws", &self.aws)
+            .field("endpoint", &self.endpoint)
+            .field("auth_manager", &self.auth_manager)
+            .field("auth_recovery", &self.auth_recovery)
+            .field("cached_auth", &self.cached_auth.initialized())
+            .finish()
+    }
 }
 
 impl AmazonBedrockModelProvider {
@@ -98,6 +118,7 @@ impl AmazonBedrockModelProvider {
             endpoint,
             auth_manager,
             auth_recovery,
+            cached_auth: Arc::new(OnceCell::new()),
         }
     }
 
@@ -153,7 +174,48 @@ impl AmazonBedrockModelProvider {
         api_provider_info.to_api_provider(/*auth_mode*/ None)
     }
 
-    async fn runtime_base_url(&self) -> Result<Option<String>> {
+    /// Resolves the Bedrock auth method once and returns both the base URL and
+    /// the auth provider derived from that single resolution. This avoids
+    /// loading the AWS SDK config (and invoking `credential_process`) multiple
+    /// times per request cycle.
+    async fn resolve_base_url_and_auth(&self) -> Result<(Option<String>, SharedAuthProvider)> {
+        let source = self.auth_source();
+
+        // Command bearer token uses a separate auth path that does not go
+        // through `resolve_auth_method`, so handle it without the combined
+        // resolution.
+        if source == auth::BedrockAuthSource::CommandBearerToken {
+            let base_url = self.runtime_base_url_only().await?;
+            let auth = self.auth().await;
+            let provider = resolve_configured_provider_auth(auth.as_ref(), &self.info)?;
+            return Ok((base_url, provider));
+        }
+
+        // For all other auth sources, resolve the auth method exactly once
+        // and derive both the base URL (from the region) and the auth
+        // provider from the same result.
+        let managed_auth = self.managed_auth();
+        let method =
+            resolve_auth_method(source, managed_auth.as_ref(), &self.aws, self.endpoint).await?;
+
+        let base_url = if self.info.base_url.is_some() {
+            self.info.base_url.clone()
+        } else {
+            let region = method.region();
+            let url = match self.endpoint {
+                BedrockEndpoint::Mantle => mantle::base_url(region)?,
+                BedrockEndpoint::Runtime => runtime::base_url(region),
+            };
+            Some(url)
+        };
+
+        let auth_provider = auth_provider_from_method(method, self.endpoint);
+        Ok((base_url, auth_provider))
+    }
+
+    /// Returns the base URL without resolving auth — used only for the command
+    /// bearer token path where auth is resolved separately.
+    async fn runtime_base_url_only(&self) -> Result<Option<String>> {
         if let Some(base_url) = self.info.base_url.clone() {
             return Ok(Some(base_url));
         }
@@ -171,15 +233,25 @@ impl AmazonBedrockModelProvider {
         Ok(Some(base_url))
     }
 
-    async fn api_auth(&self) -> Result<SharedAuthProvider> {
-        let source = self.auth_source();
-        if source == auth::BedrockAuthSource::CommandBearerToken {
-            let auth = self.auth().await;
-            return resolve_configured_provider_auth(auth.as_ref(), &self.info);
-        }
+    async fn runtime_base_url(&self) -> Result<Option<String>> {
+        let (base_url, _) = self.get_or_resolve_auth().await?;
+        Ok(base_url)
+    }
 
-        let managed_auth = self.managed_auth();
-        resolve_bedrock_provider_auth(source, managed_auth.as_ref(), &self.aws, self.endpoint).await
+    async fn api_auth(&self) -> Result<SharedAuthProvider> {
+        let (_, auth_provider) = self.get_or_resolve_auth().await?;
+        Ok(auth_provider)
+    }
+
+    /// Returns the cached `(base_url, auth_provider)` pair, resolving it on
+    /// first call. This ensures that `credential_process` (and the full AWS
+    /// SDK config load) is invoked at most once per provider instance rather
+    /// than separately for each of `runtime_base_url()` and `api_auth()`.
+    async fn get_or_resolve_auth(&self) -> Result<(Option<String>, SharedAuthProvider)> {
+        self.cached_auth
+            .get_or_try_init(|| self.resolve_base_url_and_auth())
+            .await
+            .cloned()
     }
 
     fn default_model_catalog(&self) -> ModelsResponse {
